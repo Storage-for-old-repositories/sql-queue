@@ -1,0 +1,23 @@
+{
+  "name": "gpb.queue",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "knex": "^2.5.1",
+    "pg": "^8.11.1",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/knex": "^0.16.1",
+    "@types/node": "^20.4.4",
+    "@types/uuid": "^9.0.2",
+    "typescript": "^5.1.6"
+  }
+}
