@@ -74,19 +74,7 @@ class QueueConnectorKnex extends QueueConnector {
    */
   async consumeTask({ type }) {
     const knex = this._knex;
-    const value = await knex
-      .with("next_task", (qb) => {
-        qb.select("id")
-          .from("qc_task")
-          .where({
-            status: STATUS_NEW,
-            type,
-          })
-          .limit(1)
-          .forUpdate()
-          .skipLocked();
-      })
-      .updateFrom("next_task")
+    const value = await knex('qc_task')
       .update({
         status: STATUS_PROGRESS,
         attempt: knex.raw("attempt + 1"),
@@ -96,9 +84,16 @@ class QueueConnectorKnex extends QueueConnector {
         delayed_to: null,
         updated: knex.fn.now(),
       })
-      .from("qc_task")
-      .where(knex.raw("qc_task.id = next_task.id"))
-      .returning(["qc_task.id", "qc_task.json"]);
+      .whereIn("id", function () {
+        this.select("id")
+          .from("qc_task")
+          .where("type", "=", type)
+          .andWhere("status", "=", STATUS_NEW)
+          .limit(1)
+          .forUpdate()
+          .skipLocked();
+      })
+      .returning(["id", "json"]);
 
     if (value.length === 0) {
       return null;
@@ -120,32 +115,27 @@ class QueueConnectorKnex extends QueueConnector {
    */
   async consumeFailedTask({ type }) {
     const knex = this._knex;
-    const value = await knex
-      .with("next_task", (qb) => {
-        qb.select("id")
-          .from("qc_task")
-          .where({
-            status: STATUS_ERROR,
-            type,
-          })
-          .andWhere("delayed_to", "<", knex.fn.now())
-          .limit(1)
-          .forUpdate()
-          .skipLocked();
-      })
-      .updateFrom("next_task")
+    const value = await knex("qc_task")
       .update({
         status: STATUS_PROGRESS,
         attempt: knex.raw("attempt + 1"),
         begin_time: knex.fn.now(),
         end_time: null,
-        error_text: null,
         delayed_to: null,
+        error_text: null,
         updated: knex.fn.now(),
       })
-      .from("qc_task")
-      .where(knex.raw("qc_task.id = next_task.id"))
-      .returning(["qc_task.id", "qc_task.json", "qc_task.error_text"]);
+      .whereIn("id", function () {
+        this.select("id")
+          .from("qc_task")
+          .where("type", "=", type)
+          .andWhere("status", "=", STATUS_ERROR)
+          .andWhere("delayed_to", "<", knex.fn.now())
+          .limit(1)
+          .forUpdate()
+          .skipLocked();
+      })
+      .returning(["id", "json", "error_text"]);
 
     if (value.length === 0) {
       return null;
