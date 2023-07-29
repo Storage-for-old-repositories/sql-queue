@@ -1,50 +1,103 @@
 const { QueueConnector } = require("./queue.connector");
 
+/**
+ * MSSQL +
+ * POSTGRES +
+ */
+
 const STATUS_NEW = 0;
 const STATUS_PROGRESS = 1;
 const STATUS_COMPLETED = 2;
 const STATUS_ERROR = 3;
 const STATUS_FATAL_ERROR = 4;
 
+const TABLE_NAME = "task";
+const SCHEMA_NAME = "qc";
+const PNAME = `${SCHEMA_NAME}_${TABLE_NAME}`;
+const CNAME = `${SCHEMA_NAME}.${TABLE_NAME}`;
+
+/**
+ * @param { object } props
+ * @param { number } [props.handlerDelayedTimeoutForError]
+ * @param { number } [props.handlerDelayedHangedLag]
+ */
+const driverBindingBuilder = ({
+  handlerDelayedTimeoutForError = 5,
+  handlerDelayedHangedLag = -1,
+}) => {
+  return {
+    mssql: {
+      name: "mssql",
+      delayedToForError: `DATEADD(minute, ${handlerDelayedTimeoutForError} * attempt, CURRENT_TIMESTAMP)`,
+      delayedHangedLag: `DATEADD(hour, ${handlerDelayedHangedLag}, CURRENT_TIMESTAMP)`,
+    },
+    otherwise: {
+      name: "otherwise",
+      delayedToForError: `CURRENT_TIMESTAMP + INTERVAL '${handlerDelayedTimeoutForError} minutes' * attempt`,
+      delayedHangedLag: `CURRENT_TIMESTAMP + INTERVAL '${handlerDelayedHangedLag} hour'`,
+    },
+  };
+};
+
 class QueueConnectorKnex extends QueueConnector {
   /**
    * @param { object } props
    * @param { import('knex').Knex } props.knex
+   * @param { Parameters<typeof driverBindingBuilder>[0] } [props.options]
    */
-  constructor({ knex }) {
+  constructor({ knex, options }) {
     super();
     /** @private */
     this._knex = knex;
+
+    const DRIVER_BINDING = driverBindingBuilder(options ?? {});
+
+    const driverName = knex.client.driverName;
+    /**
+     * @type { (typeof DRIVER_BINDING)[keyof typeof DRIVER_BINDING] }
+     * @private
+     */
+    this._driverBinding =
+      // @ts-ignore
+      DRIVER_BINDING[driverName] ?? DRIVER_BINDING.otherwise;
   }
 
   async init() {
+    const self = this;
     const knex = this._knex;
-    await knex.schema.hasTable("qc_task").then(async function (exists) {
-      if (!exists) {
-        await knex.schema.createTable("qc_task", (table) => {
-          table.bigIncrements("id").primary();
-          table.text("type").notNullable();
-          table.text("json").notNullable();
-          table.integer("status").notNullable().defaultTo(STATUS_NEW);
-          table.integer("attempt").notNullable().defaultTo(0);
-          table.timestamp("begin_time").nullable();
-          table.timestamp("end_time").nullable();
-          table.timestamp("delayed_to").nullable();
-          table.text("error_text").nullable();
-          table.timestamp("created").notNullable().defaultTo(knex.fn.now());
-          table.timestamp("updated").notNullable().defaultTo(knex.fn.now());
-        });
-        await knex.schema.raw(
-          "create index qc_task__status__delayed_to__idx on qc_task (status, delayed_to)"
-        );
-        await knex.schema.raw(
-          "create index qc_task__updated__idx on qc_task (updated)"
-        );
-        await knex.schema.raw(
-          "create index qc_task__type__idx on qc_task (type)"
-        );
-      }
-    });
+    await knex.schema
+      .withSchema(SCHEMA_NAME)
+      .hasTable(TABLE_NAME)
+      .then(async function (exists) {
+        if (!exists) {
+          await knex.schema
+            .withSchema(SCHEMA_NAME)
+            .createTable(TABLE_NAME, (table) => {
+              table.bigIncrements("id").primary();
+              table.text("type").notNullable();
+              table.text("json").notNullable();
+              table.integer("status").notNullable().defaultTo(STATUS_NEW);
+              table.integer("attempt").notNullable().defaultTo(0);
+              table.timestamp("begin_time").nullable();
+              table.timestamp("end_time").nullable();
+              table.timestamp("delayed_to").nullable();
+              table.text("error_text").nullable();
+              table.timestamp("created").notNullable().defaultTo(knex.fn.now());
+              table.timestamp("updated").notNullable().defaultTo(knex.fn.now());
+            });
+          await knex.schema.raw(
+            `create index ${PNAME}__status__delayed_to__idx on ${CNAME} (status, delayed_to)`
+          );
+          await knex.schema.raw(
+            `create index ${PNAME}__updated__idx on ${CNAME} (updated)`
+          );
+          if (self._isDriver("otherwise")) {
+            await knex.schema.raw(
+              `create index ${PNAME}__type__idx on ${CNAME} (type)`
+            );
+          }
+        }
+      });
   }
 
   /**
@@ -57,7 +110,7 @@ class QueueConnectorKnex extends QueueConnector {
     const jsonText = JSON.stringify(json);
 
     const knex = this._knex;
-    const [{ id }] = await knex("qc_task").insert(
+    const [{ id }] = await knex(CNAME).insert(
       {
         type,
         json: jsonText,
@@ -74,7 +127,7 @@ class QueueConnectorKnex extends QueueConnector {
    */
   async consumeTask({ type }) {
     const knex = this._knex;
-    const value = await knex('qc_task')
+    const value = await knex(CNAME)
       .update({
         status: STATUS_PROGRESS,
         attempt: knex.raw("attempt + 1"),
@@ -86,7 +139,7 @@ class QueueConnectorKnex extends QueueConnector {
       })
       .whereIn("id", function () {
         this.select("id")
-          .from("qc_task")
+          .from(CNAME)
           .where("type", "=", type)
           .andWhere("status", "=", STATUS_NEW)
           .limit(1)
@@ -115,7 +168,7 @@ class QueueConnectorKnex extends QueueConnector {
    */
   async consumeFailedTask({ type }) {
     const knex = this._knex;
-    const value = await knex("qc_task")
+    const value = await knex(CNAME)
       .update({
         status: STATUS_PROGRESS,
         attempt: knex.raw("attempt + 1"),
@@ -127,7 +180,7 @@ class QueueConnectorKnex extends QueueConnector {
       })
       .whereIn("id", function () {
         this.select("id")
-          .from("qc_task")
+          .from(CNAME)
           .where("type", "=", type)
           .andWhere("status", "=", STATUS_ERROR)
           .andWhere("delayed_to", "<", knex.fn.now())
@@ -158,7 +211,7 @@ class QueueConnectorKnex extends QueueConnector {
    */
   async completeSuccessTask({ id }) {
     const knex = this._knex;
-    await knex("qc_task").where("id", "=", id).update({
+    await knex(CNAME).where("id", "=", id).update({
       status: STATUS_COMPLETED,
       end_time: knex.fn.now(),
       delayed_to: null,
@@ -174,14 +227,12 @@ class QueueConnectorKnex extends QueueConnector {
    */
   async completeFailedTask({ id, errorText }) {
     const knex = this._knex;
-    await knex("qc_task")
+    await knex(CNAME)
       .where("id", "=", id)
       .update({
         status: STATUS_ERROR,
         end_time: knex.fn.now(),
-        delayed_to: knex.raw(
-          `CURRENT_TIMESTAMP + INTERVAL '5 minutes' * attempt`
-        ),
+        delayed_to: knex.raw(this._driverBinding.delayedToForError),
         error_text: errorText,
         updated: knex.fn.now(),
       });
@@ -194,7 +245,7 @@ class QueueConnectorKnex extends QueueConnector {
    */
   async completeFailedFatalTask({ id, errorText }) {
     const knex = this._knex;
-    await knex("qc_task").where("id", "=", id).update({
+    await knex(CNAME).where("id", "=", id).update({
       status: STATUS_FATAL_ERROR,
       end_time: knex.fn.now(),
       delayed_to: null,
@@ -209,16 +260,12 @@ class QueueConnectorKnex extends QueueConnector {
    */
   async dropHangedTasks({ type }) {
     const knex = this._knex;
-    await knex("qc_task")
+    await knex(CNAME)
       .where({
         status: STATUS_PROGRESS,
         type,
       })
-      .andWhere(
-        "updated",
-        "<",
-        knex.raw(`CURRENT_TIMESTAMP - INTERVAL '1 hour'`)
-      )
+      .andWhere("updated", "<", knex.raw(this._driverBinding.delayedHangedLag))
       .update({
         status: STATUS_ERROR,
         end_time: knex.fn.now(),
@@ -234,16 +281,12 @@ class QueueConnectorKnex extends QueueConnector {
    */
   async restartHangedTasks({ type }) {
     const knex = this._knex;
-    await knex("qc_task")
+    await knex(CNAME)
       .where({
         status: STATUS_PROGRESS,
         type,
       })
-      .andWhere(
-        "updated",
-        "<",
-        knex.raw(`CURRENT_TIMESTAMP - INTERVAL '1 hour'`)
-      )
+      .andWhere("updated", "<", knex.raw(this._driverBinding.delayedHangedLag))
       .update({
         status: STATUS_NEW,
         attempt: knex.raw("attempt + 1"),
@@ -253,6 +296,17 @@ class QueueConnectorKnex extends QueueConnector {
         delayed_to: null,
         updated: knex.fn.now(),
       });
+  }
+
+  /**
+   * @param  { ...string } drivers
+   * @private
+   */
+  _isDriver(...drivers) {
+    const isDriverMatch = drivers.find(
+      (driver) => this._driverBinding.name === driver
+    );
+    return typeof isDriverMatch == "string";
   }
 }
 
